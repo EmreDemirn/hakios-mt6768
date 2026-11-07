@@ -36,14 +36,24 @@
 #define TOPRGU_SWRST_KEY     0x1209u
 
 /* LK's framebuffer (mblock "framebuffer"), the layer LK shows the logo on. */
-#define LK_FB_BASE           0x787b0000ULL
-#define LK_FB_SIZE           0x1050000ULL
-#define LK_FB_PITCH          2944u      /* 736 pixels: LK aligns the width to 32 */
-#define PANEL_W              720u
-#define PANEL_H              1640u
+#ifndef LK_FB_BASE
+#define LK_FB_BASE           0x7cdb0000ULL
+#endif
+#ifndef LK_FB_SIZE
+#define LK_FB_SIZE           0x017e8000ULL
+#endif
+#ifndef LK_FB_PITCH
+#define LK_FB_PITCH          4352u      /* 1088 pixels: LK aligns width to 32 */
+#endif
+#ifndef PANEL_W
+#define PANEL_W              1080u
+#endif
+#ifndef PANEL_H
+#define PANEL_H              2340u
+#endif
 
-#define DISP_MUTEX_EN        0x14001020ULL
-#define DISP_MUTEX_RUN       0x14001024ULL
+#define DISP_MUTEX_EN        0x14016020ULL
+#define DISP_MUTEX_RUN       0x14016024ULL
 
 #define OVL0_BASE            0x1400b000ULL
 #define OVL_SRC_CON          0x02c      /* a bit per layer the hardware composes */
