@@ -1,19 +1,14 @@
 #!/bin/bash
-# Build mtkloader.bin. MMU off means device memory: no SIMD, strict alignment, no builtins.
-# Extra arguments go to the compiler (e.g. -DXNU_WDT_SECONDS=0).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-LLD="$ROOT/xnu-deps/host/zig/zig ld.lld"
+LLD="/opt/local/bin/ld.lld-mp-15"
+CC="/opt/local/bin/clang-mp-15"
+
 CFLAGS="--target=aarch64-linux-gnu -ffreestanding -nostdlib -fno-builtin -mgeneral-regs-only -mstrict-align -Os -Wall -Wextra"
 
-# Two headers are made here and never kept in git (.gitignore):
-#  touchfw.h   the touch controller's firmware, out of YOUR phone's hdl_firmware.img (pull-firmware.sh puts it
-#              in fw-touch/): it is the vendor's, and the controller loses it at every reset, so the loader
-#              carries it (tcm.h)
-#  font8x16.h  the loader's 8x16 text font, rasterized on a Mac by tools/mkfont8x16.swift (from a system font,
-#              which is why the bitmap is not in the repository either)
+# Touch firmware header (cached / gitignored)
 TOUCH_IMG="${TOUCH_IMG:-$ROOT/fw-touch/hdl_firmware.img}"
 if [ ! -f "$HERE/touchfw.h" ]; then
 	[ -f "$TOUCH_IMG" ] || { echo "mtkloader: no $TOUCH_IMG -- run pull-firmware.sh first" >&2; exit 1; }
@@ -21,7 +16,8 @@ if [ ! -f "$HERE/touchfw.h" ]; then
 fi
 [ -f "$HERE/font8x16.h" ] || swift "$HERE/../tools/mkfont8x16.swift" > "$HERE/font8x16.h"
 
-clang $CFLAGS "$@" -c "$HERE/start.S" -o "$HERE/start.o"
-clang $CFLAGS "$@" -c "$HERE/mtkloader.c" -o "$HERE/mtkloader.o"
+$CC $CFLAGS "$@" -c "$HERE/start.S" -o "$HERE/start.o"
+$CC $CFLAGS "$@" -c "$HERE/mtkloader.c" -o "$HERE/mtkloader.o"
 $LLD -T "$HERE/link.ld" --oformat binary "$HERE/start.o" "$HERE/mtkloader.o" -o "$HERE/mtkloader.bin"
 ls -la "$HERE/mtkloader.bin"
+
