@@ -66,6 +66,13 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define CMD_BLKLEN(n)    (((n) & 0xfffu) << 16)
 
 static vm_offset_t msdc;
+struct emmc_extent {
+	uint64_t lba;
+	uint64_t blocks;
+};
+#define MAX_EMMC_EXTS 16
+static struct emmc_extent emmc_exts[MAX_EMMC_EXTS];
+static uint32_t emmc_num_exts = 0;
 static uint64_t emmc_lba, emmc_blocks;      /* the partition: its first block, and the image's length in blocks */
 static int emmc_bmajor = -1, emmc_cmajor = -1;
 static uint32_t emmc_int_seen;              /* MSDC_INT bits read (reading clears them) but not yet used */
@@ -207,6 +214,42 @@ read_retrying(uint64_t lba, uint32_t blocks, uint32_t *dst)
 	return read_blocks(lba, blocks, dst);
 }
 
+/* read relative blocks across partition extents into dst (4-aligned) */
+static bool
+read_extent_blocks(uint64_t rel_block, uint32_t count, void *dst)
+{
+	uint8_t *p = (uint8_t *)dst;
+	while (count > 0) {
+		uint64_t b = rel_block;
+		uint64_t cur_lba = 0;
+		uint32_t avail = 0;
+
+		for (uint32_t i = 0; i < emmc_num_exts; i++) {
+			if (b < emmc_exts[i].blocks) {
+				cur_lba = emmc_exts[i].lba + b;
+				uint64_t rem = emmc_exts[i].blocks - b;
+				avail = (rem > 0xffffffffULL) ? 0xffffffffU : (uint32_t)rem;
+				break;
+			}
+			b -= emmc_exts[i].blocks;
+		}
+		if (cur_lba == 0) {
+			return false;
+		}
+		uint32_t chunk = count < avail ? count : avail;
+		if (chunk > EMMC_MAX_BLOCKS) {
+			chunk = EMMC_MAX_BLOCKS;
+		}
+		if (!read_retrying(cur_lba, chunk, (uint32_t *)(void *)p)) {
+			return false;
+		}
+		rel_block += chunk;
+		count -= chunk;
+		p += chunk * 512;
+	}
+	return true;
+}
+
 /* ---- the partition ---- */
 
 static uint32_t sector[128] __attribute__((aligned(16)));
@@ -218,6 +261,10 @@ find_partition(void)
 	const uint8_t *s = (const uint8_t *)sector;
 	uint64_t entries_lba, at;
 	uint32_t count, size;
+
+	emmc_num_exts = 0;
+	emmc_blocks = 0;
+	emmc_lba = 0;
 
 	if (!read_retrying(1, 1, sector) || memcmp(s, "EFI PART", 8) != 0) {
 		printf("emmc: no GPT (%s)\n", emmc_failed ? emmc_failed : "no signature");
@@ -247,7 +294,82 @@ find_partition(void)
 		}
 		emmc_lba = first;
 		emmc_blocks = last - first + 1;
+		emmc_exts[0].lba = first;
+		emmc_exts[0].blocks = emmc_blocks;
+		emmc_num_exts = 1;
 		break;
+	}
+	if (emmc_lba == 0) {
+		/* Not found directly in GPT. Check Android dynamic partitions inside 'super'. */
+		uint64_t super_lba = 0;
+		for (uint32_t i = 0; i < count; i++) {
+			const uint8_t *e = (const uint8_t *)entries + i * size;
+			static const char s_name[] = "super";
+			size_t k;
+			for (k = 0; s_name[k] && e[56 + 2 * k] == (uint8_t)s_name[k] && e[57 + 2 * k] == 0; k++) {
+			}
+			if (s_name[k] == 0 && e[56 + 2 * k] == 0 && e[57 + 2 * k] == 0) {
+				memcpy(&super_lba, e + 32, 8);
+				printf("emmc: found 'super' GPT partition at LBA %llu\n", super_lba);
+				break;
+			}
+		}
+		if (super_lba != 0) {
+			/* Check LP metadata slot 0 (sector 24) or slot 1 (sector 24 + 128) */
+			uint64_t meta_sectors[2] = { super_lba + 24, super_lba + 24 + 128 };
+			for (int slot = 0; slot < 2 && emmc_lba == 0; slot++) {
+				uint64_t sec = meta_sectors[slot];
+				if (!read_retrying(sec, 4, entries)) {
+					continue;
+				}
+				uint32_t *m = entries;
+				if (m[0] != 0x414c5030u) { /* "0PLA" */
+					continue;
+				}
+				uint32_t hsize = m[2];
+				uint32_t p_off = m[20];
+				uint32_t p_num = m[21];
+				uint32_t p_size = m[22];
+				uint32_t e_off = m[23];
+				uint32_t e_num = m[24];
+				uint32_t e_size = m[25];
+				printf("emmc: LP metadata at super+%llu: %u parts, %u extents\n",
+					sec - super_lba, p_num, e_num);
+				const uint8_t *t = (const uint8_t *)entries + hsize;
+				for (uint32_t i = 0; i < p_num; i++) {
+					const uint8_t *p = t + p_off + i * p_size;
+					char pname[37];
+					memcpy(pname, p, 36);
+					pname[36] = 0;
+					uint32_t ext_idx = *(const uint32_t *)(p + 40);
+					uint32_t num_exts = *(const uint32_t *)(p + 44);
+					if (strncmp(pname, EMMC_PART, 36) == 0) {
+						printf("emmc: matched '%s' (%u extents)\n", pname, num_exts);
+						for (uint32_t x = 0; x < num_exts && emmc_num_exts < MAX_EMMC_EXTS; x++) {
+							uint32_t cur_idx = ext_idx + x;
+							if (cur_idx < e_num) {
+								const uint8_t *ext = t + e_off + cur_idx * e_size;
+								uint64_t num_sec, tgt_sec;
+								uint32_t tgt_type;
+								memcpy(&num_sec, ext, 8);
+								memcpy(&tgt_type, ext + 8, 4);
+								memcpy(&tgt_sec, ext + 12, 8);
+								emmc_exts[emmc_num_exts].lba = super_lba + tgt_sec;
+								emmc_exts[emmc_num_exts].blocks = num_sec;
+								emmc_blocks += num_sec;
+								printf("emmc:   ext[%u]: LBA=%llu, cnt=%llu (%llu MB)\n",
+									emmc_num_exts, emmc_exts[emmc_num_exts].lba, num_sec, (num_sec * 512) >> 20);
+								emmc_num_exts++;
+							}
+						}
+						if (emmc_num_exts > 0) {
+							emmc_lba = emmc_exts[0].lba;
+							break;
+						}
+					}
+				}
+			}
+		}
 	}
 	if (emmc_lba == 0) {
 		printf("emmc: no " EMMC_PART " partition\n");
@@ -257,13 +379,22 @@ find_partition(void)
 	for (at = 0; at < emmc_blocks * 512;) {
 		uint32_t bs;
 		uint64_t n;
+		bool rd_ok = read_extent_blocks(at / 512, 1, sector);
 
-		if (!read_retrying(emmc_lba + at / 512, 1, sector) || sector[8] != 0x4253584eu) {   /* "NXSB" */
+		if (!rd_ok) {
+			printf("emmc: read failed at rel block %llu: %s\n", at / 512, emmc_failed ? emmc_failed : "error");
+			break;
+		}
+		if (sector[8] != 0x4253584eu) {   /* "NXSB" */
+			printf("emmc: rel block %llu sector[8]=0x%08x (expected NXSB 0x4253584e), sec[0..3]=%08x %08x %08x %08x\n",
+				at / 512, sector[8], sector[0], sector[1], sector[2], sector[3]);
 			break;
 		}
 		bs = sector[9];
 		memcpy(&n, s + 40, 8);
 		if (bs < 512 || bs > 65536 || n == 0 || n * bs > emmc_blocks * 512 - at) {
+			printf("emmc: invalid bs=%u or n=%llu at rel block %llu (blocks left %llu)\n",
+				bs, n, at / 512, (emmc_blocks * 512 - at) / 512);
 			break;
 		}
 		at += n * bs;
@@ -272,8 +403,8 @@ find_partition(void)
 		printf("emmc: no APFS container in " EMMC_PART " (tools/system-flash.sh writes it)\n");
 		return false;
 	}
-	printf("emmc: " EMMC_PART " at block %llu, %llu MB of %llu MB in its APFS containers\n", emmc_lba, at >> 20,
-	    (emmc_blocks * 512) >> 20);
+	printf("emmc: " EMMC_PART " at block %llu (%u extents), %llu MB of %llu MB in its APFS containers\n",
+		emmc_lba, emmc_num_exts, at >> 20, (emmc_blocks * 512) >> 20);
 	emmc_blocks = at / 512;
 	return true;
 }
@@ -320,7 +451,7 @@ emmc_strategy(buf_t bp)
 			/* a part block, or a buffer not 4-aligned: one block at a time through the sector buffer */
 			uint32_t n = count - done < 512 ? count - done : 512;
 
-			if (!read_retrying(emmc_lba + block + done / 512, 1, sector)) {
+			if (!read_extent_blocks(block + done / 512, 1, sector)) {
 				error = EIO;
 				break;
 			}
@@ -331,7 +462,7 @@ emmc_strategy(buf_t bp)
 		if (blocks > EMMC_MAX_BLOCKS) {
 			blocks = EMMC_MAX_BLOCKS;
 		}
-		if (!read_retrying(emmc_lba + block + done / 512, blocks, (uint32_t *)(void *)(data + done))) {
+		if (!read_extent_blocks(block + done / 512, blocks, (uint32_t *)(void *)(data + done))) {
 			error = EIO;
 			break;
 		}
@@ -432,7 +563,7 @@ redwood_emmc_root(dev_t *root)
 	probe = kalloc_data(EMMC_MAX_BLOCKS * 512, Z_WAITOK);
 	if (probe != NULL) {
 		for (uint32_t at = 0; at < 4 * 2048 && at + EMMC_MAX_BLOCKS <= emmc_blocks; at += EMMC_MAX_BLOCKS) {
-			if (!read_retrying(emmc_lba + at, EMMC_MAX_BLOCKS, probe)) {
+			if (!read_extent_blocks(at, EMMC_MAX_BLOCKS, probe)) {
 				break;
 			}
 		}
@@ -461,7 +592,7 @@ redwood_emmc_devfs(void)
 	}
 }
 
-/* sysctl kern.redwood.emmc: how much it has read, and its errors */
+/* sysctl kern.hakios.emmc: how much it has read, and its errors */
 static int
 emmc_sysctl SYSCTL_HANDLER_ARGS
 {
