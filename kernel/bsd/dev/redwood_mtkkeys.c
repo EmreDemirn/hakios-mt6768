@@ -25,6 +25,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 #define KPD_PHYS        0x10010000
 #define KP_MEM1         0x0004          /* keys 0..15, a bit clear while the key is down */
+#define KP_MEM2         0x0008          /* keys 16..31 */
 
 #define PWRAP_PHYS      0x1000d000
 #define PWRAP_WACS2_CMD     0xc20
@@ -36,6 +37,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 #define MT6358_TOPSTATUS    0x28
 #define PWRKEY_DEB          (1u << 1)   /* clear while the power key is down */
+#define HOMEKEY_DEB         (1u << 3)   /* clear while the home/aux key is down */
 
 static vm_offset_t kpd, pwrap;
 
@@ -316,13 +318,28 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 
+	static uint32_t last_mem1 = 0, last_mem2 = 0, last_top = 0;
 	for (unsigned tick = 1;; tick++) {
-		uint32_t mem = rd(kpd, KP_MEM1), top = PWRKEY_DEB;
+		uint32_t mem1 = rd(kpd, KP_MEM1), mem2 = rd(kpd, KP_MEM2), top = PWRKEY_DEB | HOMEKEY_DEB;
 		bool now[3];
 
 		(void)pmic_read(MT6358_TOPSTATUS, &top);
-		now[0] = !(mem & (1u << 0));
-		now[1] = !(mem & (1u << 1));
+
+		if (log && (mem1 != last_mem1 || mem2 != last_mem2 || top != last_top)) {
+			printf("mtkkeys: state change: mem1=%#x mem2=%#x top=%#x\n", mem1, mem2, top);
+			last_mem1 = mem1;
+			last_mem2 = last_mem2;
+			last_top = top;
+		}
+
+		/*
+		 * Merlin (Redmi Note 9):
+		 *   Volume Down: kpd-hw-init-map[0] = 114 -> bit 0 of KP_MEM1
+		 *   Volume Up:   kpd-hw-rstkey = 17 -> bit 1 of KP_MEM2 (or PMIC HOMEKEY_DEB)
+		 *   Power:       MT6358 TOPSTATUS bit 1 (PWRKEY_DEB)
+		 */
+		now[0] = !(mem2 & (1u << 1)) || !(top & HOMEKEY_DEB);
+		now[1] = !(mem1 & (1u << 0));
 		now[2] = !(top & PWRKEY_DEB);
 
 		for (unsigned i = 0; i < 3; i++) {
@@ -334,13 +351,15 @@ keys_thread(__unused void *parameter, __unused wait_result_t result)
 				redwood_touch_post(k->down ? REDWOOD_BUTTON_DOWN : REDWOOD_BUTTON_UP, k->button, 0, 0);
 				presses += k->down;
 				if (log) {
-					printf("mtkkeys: %s %s (keypad %#x, PMIC %#x)\n", k->name, k->down ? "down" : "up", mem, top);
+					printf("mtkkeys: %s %s (mem1=%#x mem2=%#x top=%#x)\n",
+					    k->name, k->down ? "down" : "up", mem1, mem2, top);
 				}
 			}
 			k->seen = now[i];
 		}
 		if (tick % 3000 == 0) {
-			printf("mtkkeys: so far %u presses; keypad %#x, PMIC status %#x\n", presses, mem, top);
+			printf("mtkkeys: so far %u presses; mem1=%#x mem2=%#x top=%#x\n",
+			    presses, mem1, mem2, top);
 		}
 		delay(20000);
 	}
