@@ -1,0 +1,3 @@
+# HakiOS defconfig for Xiaomi Redmi Note 9 (merlinx, MediaTek MT6768)
+#include common_defconfig
+#include merlinx.config
