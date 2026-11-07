@@ -30,7 +30,9 @@
 /* XNU's view of memory: one contiguous range that nothing else (LK, Android, TEE, ATF, the
  * framebuffer) uses; 0xc0000000-0xfe000000 is free DRAM on this board. */
 #define XNU_PHYS_BASE       0xc0000000ULL
-#define XNU_MEM_SIZE        0xfe000000ULL       /* up to dramc-rk1 at 0x1bffff000; room for the system image */
+#ifndef XNU_MEM_SIZE
+#define XNU_MEM_SIZE        0x78000000ULL       /* 1920 MB: safe within 4GB DRAM */
+#endif
 /* Where the system image is put, clear of the kernel, as xnuloader does it (RESIDENT_RD_OFFSET). */
 #define SYSTEM_PA           (XNU_PHYS_BASE + 0x08000000ULL)
 #define SYSTEM_PART         "xnusys"
@@ -64,7 +66,7 @@
 #ifndef XNU_CORES
 #define XNU_CORES           4
 #endif
-_Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one left for the watcher");
+_Static_assert(XNU_CORES >= 1 && XNU_CORES <= 8, "1 to 8 cores");
 
 /*
  * The processors in the order the kernel is offered them: the one this code runs on first (LK
@@ -72,7 +74,7 @@ _Static_assert(XNU_CORES >= 1 && XNU_CORES <= 7, "one core at least, and one lef
  * the rest of the A55s. So "cpus=3" already gives iOS both fast cores.
  */
 static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
-#define WATCH_CORE          core_order[XNU_CORES]
+#define WATCH_CORE          (XNU_CORES < 8 ? core_order[XNU_CORES] : 0)
 /* Checkpoint for XNU to return at (osfmk/arm/arm_init.c LOADER_CHECKPOINT), 0 = none. */
 #ifndef XNU_CHECKPOINT
 #define XNU_CHECKPOINT      0
@@ -99,7 +101,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define TIMER_PROBE         0
 #endif
 #ifndef MENU_DEFAULT_XNU
-#define MENU_DEFAULT_XNU    0
+#define MENU_DEFAULT_XNU    1
 #endif
 /*
  * 1: the kernel's text console on the screen (-v). It is a slow way to run -- scrolling reads
@@ -107,7 +109,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
  * it and the log comes back through the loader instead (v_display = 1 says "graphics mode").
  */
 #ifndef XNU_VERBOSE
-#define XNU_VERBOSE         0
+#define XNU_VERBOSE         1
 #endif
 /* More for the kernel's command line: cores, the clock (epoch=), whatever a run wants to try. */
 /* The serial number iOS is told (the device tree's serial-number): a placeholder, not any real device's. */
@@ -115,7 +117,7 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define XNU_SERIAL          "HAKIOS0000000000"
 #endif
 #ifndef XNU_EXTRA_ARGS
-#define XNU_EXTRA_ARGS      "cpus=1"
+#define XNU_EXTRA_ARGS      "cpus=4 buttons=2 mtk_cpufreq=3 touchscreen=3 touch_poll_us=2000"
 #endif
 /*
  * 1: the system image stays on the eMMC and the kernel reads it as it needs it (emmc_root=1,
@@ -131,9 +133,9 @@ static const uint8_t core_order[8] = { 0, 7, 6, 1, 2, 3, 4, 5 };
 #define XNU_ROOT_ARG        "rd=md0"
 #endif
 #if XNU_VERBOSE
-#define XNU_BOOT_ARGS       "debug=0x8 serial=3 " XNU_ROOT_ARG " -v " XNU_EXTRA_ARGS " loader_return_after=" XNU_RETURN_AFTER
+#define XNU_BOOT_ARGS       "debug=0x8 serial=0 " XNU_ROOT_ARG " -v " XNU_EXTRA_ARGS " loader_return_after=" XNU_RETURN_AFTER
 #else
-#define XNU_BOOT_ARGS       "debug=0x8 serial=3 " XNU_ROOT_ARG " " XNU_EXTRA_ARGS " loader_return_after=" XNU_RETURN_AFTER
+#define XNU_BOOT_ARGS       "debug=0x8 serial=0 " XNU_ROOT_ARG " " XNU_EXTRA_ARGS " loader_return_after=" XNU_RETURN_AFTER
 #endif
 
 #define CHAIN_OFFSET        0x40000u
@@ -409,7 +411,7 @@ static void display_find(void)
 
 	fb_base = LK_FB_BASE;
 	fb_pitch = LK_FB_PITCH;
-	if (addr >= LK_FB_BASE && addr < LK_FB_BASE + LK_FB_SIZE && pitch >= PANEL_W * 4 && pitch <= 4096) {
+	if (addr >= 0x40000000U && pitch >= PANEL_W * 4 && pitch <= 8192) {
 		fb_base = addr;
 		fb_pitch = pitch;
 	}
@@ -829,7 +831,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_prop_u32(&w, "#size-cells", 2);
 
 	dt_begin(&w, "chosen");
-	dt_prop_str(&w, "darwin-board", "x6826b");
+	dt_prop_str(&w, "darwin-board", "merlinx");
 	dt_prop(&w, "random-seed", seed, sizeof(seed));
 	dt_prop_u64(&w, "dram-base", XNU_PHYS_BASE);
 	dt_prop_u64(&w, "dram-size", XNU_MEM_SIZE);
@@ -927,7 +929,7 @@ static uint32_t build_device_tree(uint64_t dt_pa, uint64_t rd_pa, uint64_t rd_si
 	dt_end(&w);
 
 	dt_begin(&w, "arm-io");
-	dt_prop_str(&w, "device_type", "x6826b");
+	dt_prop_str(&w, "device_type", "merlinx");
 	uint64_t ranges[3] = { 0, 0x0c000000, 0x14000000 };
 	dt_prop(&w, "ranges", ranges, sizeof(ranges));
 	dt_prop_u32(&w, "#address-cells", 2);
